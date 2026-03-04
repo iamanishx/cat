@@ -124,7 +124,6 @@ export function createNewSession(): string {
         .digest("hex")
         .slice(0, 16);
     
-    // Count existing sessions in this directory to generate a name
     const countQuery = db.query("SELECT COUNT(*) as count FROM sessions WHERE path = ?");
     const result = countQuery.get(currentDir) as { count: number };
     const sessionName = `Session ${result.count + 1}`;

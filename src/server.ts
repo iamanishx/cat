@@ -4,6 +4,13 @@ import { z } from "zod";
 import { runAgentStream } from "./lib/agent.js";
 import type { AgentMessage } from "./lib/agent.js";
 
+process.on("unhandledRejection", (reason) => {
+    console.error("Unhandled rejection (suppressed):", reason);
+});
+process.on("uncaughtException", (error) => {
+    console.error("Uncaught exception (suppressed):", error);
+});
+
 const server = new McpServer({
     name: "cat-agent",
     version: "1.0.0",

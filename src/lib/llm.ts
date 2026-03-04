@@ -18,9 +18,7 @@ export function createLLMStream(input: StreamInput) {
         tools: input.tools,
         abortSignal: input.abortSignal,
         stopWhen: stepCountIs(input.maxSteps ?? 20),
-        onError(_error) {
-            // Silenced - errors are handled via the stream's error event type
-        },
+        onError(_error) {},
         async experimental_repairToolCall(failed) {
             const lower = failed.toolCall.toolName.toLowerCase();
             if (lower !== failed.toolCall.toolName && input.tools[lower]) {
