@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
-const CONFIG_DIR = join(homedir(), ".axe");
+const CONFIG_DIR = join(homedir(), ".cat");
 const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 
 export type ProviderName =

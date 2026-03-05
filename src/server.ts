@@ -1,29 +1,40 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { runAgentStream } from "./lib/agent.js";
-import type { AgentMessage } from "./lib/agent.js";
-
-process.on("unhandledRejection", (reason) => {
-    console.error("Unhandled rejection (suppressed):", reason);
-});
-process.on("uncaughtException", (error) => {
-    console.error("Uncaught exception (suppressed):", error);
-});
+import { runTaskWithTodos } from "./lib/agent.js";
+import { startTask, getTaskProgress, abortTask, failTask } from "./lib/taskManager.js";
 
 const server = new McpServer({
     name: "cat-agent",
     version: "1.0.0",
 });
 
+// Track active background tasks so we can defer process exit until they finish.
+let activeTasks = 0;
+let shuttingDown = false;
+
+function maybeExit() {
+    if (shuttingDown && activeTasks === 0) {
+        process.exit(0);
+    }
+}
+
+function handleShutdown() {
+    shuttingDown = true;
+    maybeExit();
+    // Hard exit after 10 minutes regardless.
+    setTimeout(() => process.exit(0), 10 * 60 * 1000).unref();
+}
+
 server.registerTool(
-    "run-task",
+    "run_task",
     {
         title: "Run Task",
         description:
             "Delegate a coding task to the Cat agent. It has access to the filesystem, shell, and web search. " +
             "It will autonomously execute the task and return results. " +
-            "Use this for code generation, debugging, file editing, running commands, or any software engineering task.",
+            "Use this for code generation, debugging, file editing, running commands, or any software engineering task. " +
+            "This tool returns immediately with a task ID that can be used to poll for progress.",
         inputSchema: z.object({
             prompt: z.string().describe("The task or instruction to execute"),
             workingDirectory: z
@@ -41,56 +52,33 @@ server.registerTool(
                 .describe("Optional conversation history for context"),
         }),
     },
-    async ({ prompt, workingDirectory, history }) => {
-        if (workingDirectory) {
+    async ({ prompt, workingDirectory }) => {
+        const cwd = workingDirectory || process.cwd();
+        
+        const task = startTask(prompt, cwd);
+        
+        activeTasks++;
+        setImmediate(async () => {
             try {
-                process.chdir(workingDirectory);
-            } catch (e: any) {
-                return {
-                    content: [
-                        {
-                            type: "text" as const,
-                            text: `Error: Could not change to directory ${workingDirectory}: ${e.message}`,
-                        },
-                    ],
-                };
-            }
-        }
-
-        const agentHistory: AgentMessage[] = (history || []).map((h) => ({
-            role: h.role,
-            content: h.content,
-        }));
-
-        let fullResponse = "";
-
-        try {
-            for await (const event of runAgentStream(prompt, agentHistory)) {
-                switch (event.type) {
-                    case "text":
-                        fullResponse += event.content;
-                        break;
-                    case "thinking":
-                        fullResponse += `\n[${event.content}]\n`;
-                        break;
+                for await (const _event of runTaskWithTodos(task.id, prompt, cwd)) {
                 }
+            } catch (error: any) {
+                failTask(task.id, error?.message || "Task execution failed");
+            } finally {
+                activeTasks--;
+                maybeExit();
             }
-        } catch (error: any) {
-            return {
-                content: [
-                    {
-                        type: "text" as const,
-                        text: `Agent error: ${error.message}`,
-                    },
-                ],
-            };
-        }
-
+        });
+        
         return {
             content: [
                 {
                     type: "text" as const,
-                    text: fullResponse || "(no output)",
+                    text: JSON.stringify({
+                        taskId: task.id,
+                        status: "planning",
+                        message: "Task created. Use get_progress to check status.",
+                    }),
                 },
             ],
         };
@@ -151,13 +139,101 @@ server.registerTool(
     }
 );
 
+server.registerTool(
+    "get_progress",
+    {
+        title: "Get Task Progress",
+        description: "Poll for the status of a running task. Returns completed, pending, and failed todos.",
+        inputSchema: z.object({
+            taskId: z.string().describe("The task ID returned from run_task"),
+        }),
+    },
+    async ({ taskId }) => {
+        const progress = getTaskProgress(taskId);
+        
+        if (!progress) {
+            return {
+                content: [
+                    {
+                        type: "text" as const,
+                        text: JSON.stringify({ error: "Task not found" }),
+                    },
+                ],
+            };
+        }
+        
+        return {
+            content: [
+                {
+                    type: "text" as const,
+                    text: JSON.stringify({
+                        taskId: progress.taskId,
+                        status: progress.status,
+                        currentTodo: progress.currentTodo,
+                        completedTodos: progress.completedTodos,
+                        pendingTodos: progress.pendingTodos,
+                        failedTodos: progress.failedTodos,
+                        result: progress.result,
+                        error: progress.error,
+                    }),
+                },
+            ],
+        };
+    }
+);
+
+server.registerTool(
+    "abort_task",
+    {
+        title: "Abort Task",
+        description: "Abort a running task by its ID.",
+        inputSchema: z.object({
+            taskId: z.string().describe("The task ID to abort"),
+        }),
+    },
+    async ({ taskId }) => {
+        const success = abortTask(taskId);
+        
+        return {
+            content: [
+                {
+                    type: "text" as const,
+                    text: JSON.stringify({
+                        success,
+                        taskId,
+                        message: success ? "Task aborted" : "Task not found or already completed",
+                    }),
+                },
+            ],
+        };
+    }
+);
+
 async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error("Cat MCP server running on stdio");
+
+    // Keep the process alive while background tasks are running.
+    // KiloCode/Cursor close stdin (and send SIGTERM) when they restart the server,
+    // but background tasks must be allowed to finish writing to SQLite first.
+    const keepAlive = setInterval(() => {}, 30_000);
+
+    process.on("SIGTERM", () => {
+        clearInterval(keepAlive);
+        handleShutdown();
+    });
+
+    process.on("SIGINT", () => {
+        clearInterval(keepAlive);
+        handleShutdown();
+    });
+
+    process.stdin.on("end", () => {
+        clearInterval(keepAlive);
+        handleShutdown();
+    });
 }
 
-main().catch((error) => {
-    console.error("Fatal error:", error);
+main().catch(() => {
     process.exit(1);
 });
